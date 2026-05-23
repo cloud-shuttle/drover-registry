@@ -115,3 +115,107 @@ func (s *Store) GetVersionByNameVersion(ctx context.Context, tenantID, name, ver
 	pv.Manifest = manifestRaw
 	return &pv, nil
 }
+
+// ListVersions returns all versions for a given package in a tenant (newest first).
+func (s *Store) ListVersions(ctx context.Context, tenantID, name string) ([]PackageVersion, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	const q = `
+		SELECT pv.id, pv.package_id, pv.version, pv.digest, pv.size_bytes, pv.storage_key, pv.manifest, pv.published_by, pv.created_at
+		FROM package_versions pv
+		JOIN packages p ON p.id = pv.package_id
+		WHERE p.tenant_id = $1 AND p.name = $2
+		ORDER BY pv.created_at DESC
+	`
+	rows, err := s.db.Query(ctx, q, tenantID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var versions []PackageVersion
+	for rows.Next() {
+		var pv PackageVersion
+		var manifestRaw []byte
+		if err := rows.Scan(&pv.ID, &pv.PackageID, &pv.Version, &pv.Digest, &pv.SizeBytes, &pv.StorageKey, &manifestRaw, &pv.PublishedBy, &pv.CreatedAt); err != nil {
+			return nil, err
+		}
+		pv.Manifest = manifestRaw
+		versions = append(versions, pv)
+	}
+	return versions, nil
+}
+
+// GetVersionByDigest looks up a specific version using the content digest (very useful for OCI-like resolution).
+func (s *Store) GetVersionByDigest(ctx context.Context, tenantID, name, digest string) (*PackageVersion, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	const q = `
+		SELECT pv.id, pv.package_id, pv.version, pv.digest, pv.size_bytes, pv.storage_key, pv.manifest, pv.published_by, pv.created_at
+		FROM package_versions pv
+		JOIN packages p ON p.id = pv.package_id
+		WHERE p.tenant_id = $1 AND p.name = $2 AND pv.digest = $3
+		LIMIT 1
+	`
+	row := s.db.QueryRow(ctx, q, tenantID, name, digest)
+
+	var pv PackageVersion
+	var manifestRaw []byte
+	err := row.Scan(&pv.ID, &pv.PackageID, &pv.Version, &pv.Digest, &pv.SizeBytes, &pv.StorageKey, &manifestRaw, &pv.PublishedBy, &pv.CreatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	pv.Manifest = manifestRaw
+	return &pv, nil
+}
+
+// SearchByManifestField is a simple example of querying inside the JSONB manifest (e.g. by type or label).
+func (s *Store) SearchByManifestField(ctx context.Context, tenantID, field, value string, limit int) ([]PackageVersion, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+
+	// Simple containment query: manifest @> '{"type": "crew"}' or similar
+	// For flexibility we use a jsonb_path_exists or @> with constructed object.
+	q := `
+		SELECT pv.id, pv.package_id, pv.version, pv.digest, pv.size_bytes, pv.storage_key, pv.manifest, pv.published_by, pv.created_at
+		FROM package_versions pv
+		JOIN packages p ON p.id = pv.package_id
+		WHERE p.tenant_id = $1
+		  AND pv.manifest @> $2::jsonb
+		ORDER BY pv.created_at DESC
+		LIMIT $3
+	`
+
+	condition := map[string]string{field: value}
+	condJSON, _ := json.Marshal(condition)
+
+	rows, err := s.db.Query(ctx, q, tenantID, condJSON, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []PackageVersion
+	for rows.Next() {
+		var pv PackageVersion
+		var manifestRaw []byte
+		if err := rows.Scan(&pv.ID, &pv.PackageID, &pv.Version, &pv.Digest, &pv.SizeBytes, &pv.StorageKey, &manifestRaw, &pv.PublishedBy, &pv.CreatedAt); err != nil {
+			return nil, err
+		}
+		pv.Manifest = manifestRaw
+		results = append(results, pv)
+	}
+	return results, nil
+}
+

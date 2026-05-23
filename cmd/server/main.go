@@ -18,6 +18,7 @@ import (
 	"github.com/cloud-shuttle/drover-registry/internal/infra"
 	"github.com/cloud-shuttle/drover-registry/internal/metadata"
 	appstorage "github.com/cloud-shuttle/drover-registry/internal/storage"
+	"github.com/cloud-shuttle/drover-registry/internal/webhook"
 	"github.com/gofiber/fiber/v2"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -115,22 +116,112 @@ func main() {
 	// Real package routes (with tenant from context)
 	registerPackageRoutes(api, storageProvider, db, cfg, appLogger)
 
-	// === Basic OCI distribution support (for oras / docker push) ===
-	// This is intentionally minimal. Full chunked uploads, auth, recursive manifests etc.
-	// will be expanded in a dedicated follow-up.
+	// === Basic OCI distribution support (single-layer oras push) ===
+	// Supports monolithic blob upload + manifest for simple artifacts.
+	// Not a full registry (no chunking, limited auth integration).
 	oci := app.Group("/v2")
 	oci.Get("/", func(c *fiber.Ctx) error {
 		c.Set("Docker-Distribution-API-Version", "registry/2.0")
 		return c.SendStatus(fiber.StatusOK)
 	})
-	oci.Get("/:name/manifests/:ref", func(c *fiber.Ctx) error {
-		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest GET is not fully implemented yet. Use the /v1/packages REST API for now."})
-	})
-	oci.Put("/:name/manifests/:ref", func(c *fiber.Ctx) error {
-		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest PUT coming soon"})
-	})
+
+	// In-memory upload sessions for demo (in real life use Redis/DB)
+	uploadSessions := make(map[string]string) // uuid -> repository name
+
+	// Start blob upload
 	oci.Post("/:name/blobs/uploads/", func(c *fiber.Ctx) error {
-		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI blob upload not yet supported"})
+		name := c.Params("name")
+		uuid := "u" + fmt.Sprintf("%d", time.Now().UnixNano())
+		uploadSessions[uuid] = name
+
+		location := fmt.Sprintf("/v2/%s/blobs/uploads/%s", name, uuid)
+		c.Set("Location", location)
+		c.Set("Docker-Upload-Uuid", uuid)
+		c.Set("Docker-Distribution-API-Version", "registry/2.0")
+		return c.SendStatus(fiber.StatusAccepted)
+	})
+
+	// Complete blob upload (monolithic)
+	oci.Put("/:name/blobs/uploads/:uuid", func(c *fiber.Ctx) error {
+		name := c.Params("name")
+		uuid := c.Params("uuid")
+		digest := c.Query("digest")
+
+		if digest == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "digest query parameter required"})
+		}
+
+		// Read entire body (for small layers this is fine)
+		body := c.Body()
+		if len(body) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty blob"})
+		}
+
+		// Store using our existing provider under a synthetic tenant for OCI demo
+		tenant := "oci"
+		ref := appstorage.PackageRef{
+			TenantID: tenant,
+			Name:     name,
+			Version:  digest, // use digest as "version" for uniqueness
+			Digest:   digest,
+		}
+
+		_, err := storageProvider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), digest)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		delete(uploadSessions, uuid)
+
+		c.Set("Docker-Distribution-API-Version", "registry/2.0")
+		c.Set("Location", fmt.Sprintf("/v2/%s/blobs/%s", name, digest))
+		return c.SendStatus(fiber.StatusCreated)
+	})
+
+	// Head blob (existence check)
+	oci.Head("/:name/blobs/:digest", func(c *fiber.Ctx) error {
+		digest := c.Params("digest")
+		// Quick existence via storage (we use a synthetic ref)
+		ref := appstorage.PackageRef{TenantID: "oci", Name: c.Params("name"), Version: digest, Digest: digest}
+		exists, _ := storageProvider.Exists(c.Context(), ref)
+		if !exists {
+			return c.SendStatus(fiber.StatusNotFound)
+		}
+		c.Set("Docker-Distribution-API-Version", "registry/2.0")
+		c.Set("Docker-Content-Digest", digest)
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	// Manifest put (the final step of oras push)
+	oci.Put("/:name/manifests/:ref", func(c *fiber.Ctx) error {
+		name := c.Params("name")
+		tag := c.Params("ref") // can be tag or digest
+		body := c.Body()
+
+		// For demo we store the manifest the same way
+		digest := fmt.Sprintf("sha256:manifest-%d", time.Now().UnixNano()) // real impl would parse and compute digest
+		ref := appstorage.PackageRef{
+			TenantID: "oci",
+			Name:     name,
+			Version:  tag,
+			Digest:   digest,
+		}
+		_, err := storageProvider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), digest)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		c.Set("Docker-Distribution-API-Version", "registry/2.0")
+		c.Set("Docker-Content-Digest", digest)
+		c.Set("Location", fmt.Sprintf("/v2/%s/manifests/%s", name, tag))
+		return c.SendStatus(fiber.StatusCreated)
+	})
+
+	// Basic manifest get (for pull)
+	oci.Get("/:name/manifests/:ref", func(c *fiber.Ctx) error {
+		// For a real single-layer flow this would return the manifest we stored.
+		// Stub for now so oras push at least succeeds; full roundtrip later.
+		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest GET not fully wired for pull yet"})
 	})
 
 	// Start server
@@ -160,6 +251,12 @@ func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *i
 	var metaStore *metadata.Store
 	if db != nil {
 		metaStore = metadata.NewStore(db)
+	}
+
+	// Webhook publisher to drover-muster (fire-and-forget)
+	var hookPublisher *webhook.Publisher
+	if cfg.MusterWebhookURL != "" {
+		hookPublisher = webhook.NewPublisher(cfg)
 	}
 
 	// POST /v1/packages - real implementation with manifest extraction + Postgres
@@ -253,6 +350,12 @@ func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *i
 		if metaStore != nil {
 			pkgID, err := metaStore.UpsertPackage(c.Context(), tenant, name)
 			if err == nil {
+				publishedBy := "dev"
+				if v := c.Locals("userID"); v != nil {
+					if s, ok := v.(string); ok && s != "" {
+						publishedBy = s
+					}
+				}
 				mv := &metadata.PackageVersion{
 					PackageID:   pkgID,
 					Version:     version,
@@ -260,11 +363,18 @@ func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *i
 					SizeBytes:   info.Size,
 					StorageKey:  info.StorageKey,
 					Manifest:    manifestRaw,
-					PublishedBy: c.Locals("userID", "dev").(string),
+					PublishedBy: publishedBy,
 				}
 				_ = metaStore.InsertVersion(c.Context(), pkgID, mv)
 				dbID = mv.ID
 			}
+		}
+
+		// 6. Fire webhook to drover-muster (non-blocking)
+		if hookPublisher != nil {
+			go func() {
+				_ = hookPublisher.Publish(context.Background(), tenant, name, version, digest, info.Size, info.StorageKey)
+			}()
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
