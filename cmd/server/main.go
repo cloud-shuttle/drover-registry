@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/cloud-shuttle/drover-registry/internal/config"
 	"github.com/cloud-shuttle/drover-registry/internal/infra"
+	appstorage "github.com/cloud-shuttle/drover-registry/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -77,7 +80,6 @@ func main() {
 	// api.Use(authMiddleware)
 
 	// Basic publish/fetch routes (dreg-002 starter)
-	// These will be moved to internal/api/handlers once we have real implementations
 	registerPackageRoutes(api, storageProvider, db, cfg, appLogger)
 
 	// Start server
@@ -102,31 +104,70 @@ func main() {
 	appLogger.Info("server stopped")
 }
 
-func registerPackageRoutes(api fiber.Router, sp interface{}, db *infra.DB, cfg config.Config, appLogger *slog.Logger) {
-	// Placeholder routes for publish / fetch (will be replaced with real handlers)
+func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *infra.DB, cfg config.Config, appLogger *slog.Logger) {
 	api.Post("/packages", func(c *fiber.Ctx) error {
-		// TODO: real multipart upload + manifest parsing + storage.Put + DB insert
+		tenant := c.Get("X-Org-ID", "dev")
+		name := c.Query("name", "unnamed")
+		version := c.Query("version", "v0.0.0-dev")
+		digest := c.Query("digest", "sha256:dev")
+
+		ref := appstorage.PackageRef{
+			TenantID: tenant,
+			Name:     name,
+			Version:  version,
+			Digest:   digest,
+		}
+
+		body := c.Body()
+		if len(body) == 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty body"})
+		}
+
+		checksum := digest // in real flow we would compute or trust header
+		info, err := provider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), checksum)
+		if err != nil {
+			appLogger.Error("storage put failed", "error", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"message": "publish endpoint wired (stub)",
-			"tenant":  c.Get("X-Org-ID", "dev"),
-			"name":    "example-package",
-			"version": "v0.1.0-stub",
+			"message":     "package stored",
+			"tenant":      tenant,
+			"name":        name,
+			"version":     version,
+			"size":        info.Size,
+			"storage_key": info.StorageKey,
 		})
 	})
 
 	api.Get("/packages/:tenant/:name/:version", func(c *fiber.Ctx) error {
-		// TODO: lookup in DB or storage, stream back
-		return c.JSON(fiber.Map{
-			"tenant":  c.Params("tenant"),
-			"name":    c.Params("name"),
-			"version": c.Params("version"),
-			"status":  "stub - will stream tarball",
-		})
+		ref := appstorage.PackageRef{
+			TenantID: c.Params("tenant"),
+			Name:     c.Params("name"),
+			Version:  c.Params("version"),
+			Digest:   c.Query("digest", ""),
+		}
+
+		rc, info, err := provider.Get(c.Context(), ref)
+		if err != nil {
+			if errors.Is(err, appstorage.ErrNotFound) {
+				return c.SendStatus(fiber.StatusNotFound)
+			}
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+		defer rc.Close()
+
+		c.Set("Content-Type", "application/octet-stream")
+		c.Set("Content-Length", fmt.Sprintf("%d", info.Size))
+		return c.SendStream(rc)
 	})
 
-	// Simple list for a tenant
 	api.Get("/packages/:tenant", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"tenant": c.Params("tenant"), "packages": []string{}})
+		return c.JSON(fiber.Map{
+			"tenant":   c.Params("tenant"),
+			"message":  "list endpoint - metadata index coming with Postgres",
+			"packages": []string{},
+		})
 	})
 }
 
