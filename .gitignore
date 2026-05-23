@@ -1,0 +1,65 @@
+# Binaries (root-anchored to avoid matching cmd/ paths)
+/drover-registry
+/drover-registry-*
+/server
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+build/
+bin/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Local database files
+*.db
+*.db-shm
+*.db-wal
+drover-registry.db
+
+# Local storage for dev (local disk backend)
+storage/
+data/
+
+# Temporary files
+*.tmp
+*.temp
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.log
+debug.txt
+.release/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Beads (if using local only, but we track .beads/ for this project)
+# .beads/
+
+# Docker / Compose overrides
+docker-compose.override.yml
