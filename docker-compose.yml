@@ -1,0 +1,96 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: drover-registry-db
+    environment:
+      POSTGRES_USER: drover
+      POSTGRES_PASSWORD: drover_dev_password
+      POSTGRES_DB: drover_registry
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drover -d drover_registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - drover
+
+  # MinIO (S3-compatible object storage for dev)
+  minio:
+    image: minio/minio:latest
+    container_name: drover-registry-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - drover
+
+  # The registry service
+  registry:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: drover-registry
+    environment:
+      DROVER_REGISTRY_DB_URL: postgres://drover:drover_dev_password@postgres:5432/drover_registry?sslmode=disable
+      DROVER_REGISTRY_SERVER_HOST: 0.0.0.0
+      DROVER_REGISTRY_SERVER_PORT: 8080
+      DROVER_REGISTRY_STORAGE_BACKEND: s3
+      DROVER_REGISTRY_S3_BUCKET: drover-registry-dev
+      DROVER_REGISTRY_S3_REGION: us-east-1
+      DROVER_REGISTRY_S3_ENDPOINT: http://minio:9000
+      DROVER_REGISTRY_S3_ACCESS_KEY_ID: minioadmin
+      DROVER_REGISTRY_S3_SECRET_ACCESS_KEY: minioadmin
+      DROVER_REGISTRY_S3_USE_PATH_STYLE: "true"
+      DROVER_REGISTRY_ENABLE_DEV_AUTH: "true"
+      DROVER_REGISTRY_LOG_LEVEL: info
+      # Optional: Zitadel in real env
+      # DROVER_REGISTRY_ZITADEL_ISSUER: https://your-zitadel...
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    volumes:
+      - registry_storage:/data/storage
+    networks:
+      - drover
+    command: ["/app/drover-registry"]
+
+  # Optional: run migrations once (useful in CI or manual)
+  migrate:
+    image: migrate/migrate
+    profiles: ["migrate"]
+    entrypoint: ["migrate", "-path=/migrations", "-database=postgres://drover:drover_dev_password@postgres:5432/drover_registry?sslmode=disable", "up"]
+    volumes:
+      - ./migrations:/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - drover
+
+volumes:
+  postgres_data:
+  minio_data:
+  registry_storage:
+
+networks:
+  drover:
+    driver: bridge

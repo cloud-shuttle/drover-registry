@@ -5,14 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cloud-shuttle/drover-registry/internal/api/middleware"
 	"github.com/cloud-shuttle/drover-registry/internal/config"
 	"github.com/cloud-shuttle/drover-registry/internal/infra"
+	"github.com/cloud-shuttle/drover-registry/internal/metadata"
 	appstorage "github.com/cloud-shuttle/drover-registry/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
@@ -49,6 +53,27 @@ func main() {
 	}
 	appLogger.Info("storage backend ready", "backend", cfg.StorageBackend)
 
+	// === Auth setup (dreg-003) ===
+	var authMw *middleware.AuthMiddleware
+	var zitadelValidator *infra.ZitadelValidator
+
+	if cfg.ZitadelIssuer != "" {
+		var err error
+		zitadelValidator, err = infra.NewZitadelValidator(cfg.ZitadelIssuer)
+		if err != nil {
+			appLogger.Error("failed to initialize Zitadel validator", "issuer", cfg.ZitadelIssuer, "error", err)
+			// Do not crash in dev; fall back to dev auth if enabled
+			if !cfg.EnableDevAuth {
+				os.Exit(1)
+			}
+			appLogger.Warn("falling back to dev auth because Zitadel init failed")
+		} else {
+			appLogger.Info("Zitadel auth enabled", "issuer", cfg.ZitadelIssuer)
+		}
+	}
+
+	authMw = middleware.NewAuthMiddleware(zitadelValidator, cfg)
+
 	app := fiber.New(fiber.Config{
 		AppName:      "drover-registry",
 		ServerHeader: "drover-registry/0.1.0",
@@ -73,14 +98,40 @@ func main() {
 		return c.JSON(fiber.Map{"status": "ready"})
 	})
 
-	// === v1 API (tenant aware) ===
+	// === v1 API (tenant aware via auth) ===
 	api := app.Group("/v1")
 
-	// TODO (next): add auth middleware here (Zitadel + dev header)
-	// api.Use(authMiddleware)
+	// Apply auth (Zitadel or dev header)
+	if cfg.ZitadelIssuer != "" || cfg.EnableDevAuth {
+		api.Use(authMw.Handler())
+	} else {
+		// Last resort: still require some tenant context
+		api.Use(middleware.DevAuthMiddleware())
+	}
 
-	// Basic publish/fetch routes (dreg-002 starter)
+	// Enforce that every request on /v1 has a tenant
+	api.Use(middleware.RequireTenant())
+
+	// Real package routes (with tenant from context)
 	registerPackageRoutes(api, storageProvider, db, cfg, appLogger)
+
+	// === Basic OCI distribution support (for oras / docker push) ===
+	// This is intentionally minimal. Full chunked uploads, auth, recursive manifests etc.
+	// will be expanded in a dedicated follow-up.
+	oci := app.Group("/v2")
+	oci.Get("/", func(c *fiber.Ctx) error {
+		c.Set("Docker-Distribution-API-Version", "registry/2.0")
+		return c.SendStatus(fiber.StatusOK)
+	})
+	oci.Get("/:name/manifests/:ref", func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest GET is not fully implemented yet. Use the /v1/packages REST API for now."})
+	})
+	oci.Put("/:name/manifests/:ref", func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest PUT coming soon"})
+	})
+	oci.Post("/:name/blobs/uploads/", func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI blob upload not yet supported"})
+	})
 
 	// Start server
 	addr := fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort)
@@ -105,12 +156,84 @@ func main() {
 }
 
 func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *infra.DB, cfg config.Config, appLogger *slog.Logger) {
+	// Create metadata store when DB is available
+	var metaStore *metadata.Store
+	if db != nil {
+		metaStore = metadata.NewStore(db)
+	}
+
+	// POST /v1/packages - real implementation with manifest extraction + Postgres
 	api.Post("/packages", func(c *fiber.Ctx) error {
-		tenant := c.Get("X-Org-ID", "dev")
+		tenant := middleware.GetTenant(c)
+
+		// 1. Obtain the artifact bytes (support raw body or multipart "file")
+		var artifactReader io.Reader
+		var artifactSize int64
+		contentType := c.Get("Content-Type")
+
+		if strings.HasPrefix(contentType, "multipart/form-data") {
+			form, err := c.MultipartForm()
+			if err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid multipart form"})
+			}
+			files := form.File["file"]
+			if len(files) == 0 {
+				files = form.File["artifact"]
+			}
+			if len(files) == 0 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no 'file' field in multipart upload"})
+			}
+			fh := files[0]
+			artifactSize = fh.Size
+			f, err := fh.Open()
+			if err != nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open uploaded file"})
+			}
+			defer f.Close()
+			artifactReader = f
+		} else {
+			// raw body
+			body := c.Body()
+			if len(body) == 0 {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty body (send tarball as raw body or multipart 'file')"})
+			}
+			artifactReader = bytes.NewReader(body)
+			artifactSize = int64(len(body))
+		}
+
+		// 2. Try to extract manifest.json from the tarball (best effort)
+		manifest, manifestRaw, err := metadata.ExtractManifestFromTarball(artifactReader)
+		if err != nil {
+			appLogger.Warn("manifest extraction failed (continuing without it)", "error", err)
+		}
+
+		// Reset reader because we consumed it during extraction.
+		// For this milestone we support in-memory or seekable readers (multipart files are re-opened by the form lib).
+		var finalReader io.Reader
+		if rs, ok := artifactReader.(io.ReadSeeker); ok {
+			rs.Seek(0, 0)
+			finalReader = rs
+		} else if b, ok := artifactReader.(*bytes.Reader); ok {
+			b.Seek(0, 0)
+			finalReader = b
+		} else {
+			// multipart file case: the original file handle from the form is still valid
+			finalReader = artifactReader
+		}
+
+		// 3. Determine final name/version (prefer manifest)
 		name := c.Query("name", "unnamed")
 		version := c.Query("version", "v0.0.0-dev")
-		digest := c.Query("digest", "sha256:dev")
+		if manifest != nil {
+			if manifest.Name != "" {
+				name = manifest.Name
+			}
+			if manifest.Version != "" {
+				version = manifest.Version
+			}
+		}
 
+		digest := c.Query("digest", fmt.Sprintf("sha256:upload-%d", time.Now().UnixNano()))
 		ref := appstorage.PackageRef{
 			TenantID: tenant,
 			Name:     name,
@@ -118,25 +241,41 @@ func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *i
 			Digest:   digest,
 		}
 
-		body := c.Body()
-		if len(body) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty body"})
-		}
-
-		checksum := digest // in real flow we would compute or trust header
-		info, err := provider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), checksum)
+		// 4. Store the artifact
+		info, err := provider.Put(c.Context(), ref, finalReader, artifactSize, digest)
 		if err != nil {
 			appLogger.Error("storage put failed", "error", err)
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 		}
 
+		// 5. Persist metadata if DB is available
+		var dbID int64
+		if metaStore != nil {
+			pkgID, err := metaStore.UpsertPackage(c.Context(), tenant, name)
+			if err == nil {
+				mv := &metadata.PackageVersion{
+					PackageID:   pkgID,
+					Version:     version,
+					Digest:      digest,
+					SizeBytes:   info.Size,
+					StorageKey:  info.StorageKey,
+					Manifest:    manifestRaw,
+					PublishedBy: c.Locals("userID", "dev").(string),
+				}
+				_ = metaStore.InsertVersion(c.Context(), pkgID, mv)
+				dbID = mv.ID
+			}
+		}
+
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"message":     "package stored",
+			"message":     "package published",
 			"tenant":      tenant,
 			"name":        name,
 			"version":     version,
 			"size":        info.Size,
+			"digest":      digest,
 			"storage_key": info.StorageKey,
+			"db_record":   dbID > 0,
 		})
 	})
 
@@ -165,7 +304,7 @@ func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *i
 	api.Get("/packages/:tenant", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"tenant":   c.Params("tenant"),
-			"message":  "list endpoint - metadata index coming with Postgres",
+			"message":  "list endpoint - full metadata index coming with more queries",
 			"packages": []string{},
 		})
 	})
