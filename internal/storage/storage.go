@@ -2,8 +2,14 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
+)
+
+var (
+	ErrNotFound         = errors.New("object not found")
+	ErrChecksumMismatch = errors.New("checksum mismatch")
 )
 
 // PackageRef identifies a stored artifact (package version).

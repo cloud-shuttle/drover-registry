@@ -12,8 +12,8 @@ import (
 // TODO: full implementation using cloud.google.com/go/storage + checksums.
 type GCS struct{}
 
-func New(cfg storage.Config) (*GCS, error) {
-	return nil, errors.New("GCS backend not yet implemented (coming in dreg-001)")
+func New(cfg interface{}) (*GCS, error) {
+	return nil, errors.New("GCS backend not yet implemented (real impl in progress)")
 }
 
 func (g *GCS) Put(ctx context.Context, ref storage.PackageRef, r io.Reader, size int64, checksum string) (*storage.ObjectInfo, error) {

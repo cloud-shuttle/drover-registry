@@ -59,5 +59,5 @@ func TestLocal_PutGetDelete(t *testing.T) {
 	badRef := ref
 	badRef.Digest = "sha256:deadbeef"
 	_, err = l.Put(context.Background(), badRef, bytes.NewReader(data), int64(len(data)), badRef.Digest)
-	require.ErrorIs(t, err, ErrChecksumMismatch)
+	require.ErrorIs(t, err, storage.ErrChecksumMismatch)
 }

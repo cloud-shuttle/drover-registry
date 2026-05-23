@@ -16,11 +16,6 @@ import (
 	"github.com/cloud-shuttle/drover-registry/internal/storage"
 )
 
-var (
-	ErrChecksumMismatch = errors.New("checksum mismatch")
-	ErrNotFound         = errors.New("object not found")
-)
-
 // Local implements storage.Provider using the local filesystem.
 // Layout: <root>/<tenantID>/<name>/<version>/<digest>.tar.gz  (or .tar)
 type Local struct {
@@ -92,7 +87,7 @@ func (l *Local) Put(ctx context.Context, ref storage.PackageRef, r io.Reader, si
 
 	got := "sha256:" + hex.EncodeToString(h.Sum(nil))
 	if got != checksum {
-		return nil, fmt.Errorf("%w: got %s want %s", ErrChecksumMismatch, got, checksum)
+		return nil, fmt.Errorf("%w: got %s want %s", storage.ErrChecksumMismatch, got, checksum)
 	}
 
 	if err := f.Sync(); err != nil {
@@ -121,7 +116,7 @@ func (l *Local) Get(ctx context.Context, ref storage.PackageRef) (io.ReadCloser,
 	f, err := os.Open(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, ErrNotFound
+			return nil, nil, storage.ErrNotFound
 		}
 		return nil, nil, fmt.Errorf("open: %w", err)
 	}
@@ -171,7 +166,7 @@ func (l *Local) Head(ctx context.Context, ref storage.PackageRef) (*storage.Obje
 	stat, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, ErrNotFound
+			return nil, storage.ErrNotFound
 		}
 		return nil, err
 	}
