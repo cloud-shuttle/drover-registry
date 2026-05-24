@@ -219,3 +219,73 @@ func (s *Store) SearchByManifestField(ctx context.Context, tenantID, field, valu
 	return results, nil
 }
 
+// PublishPackage publishes a new package version or updates it inside postgres storage.
+func (s *Store) PublishPackage(ctx context.Context, tenantID string, name string, version string, digest string, sizeBytes int64, storageKey string, manifest []byte, publishedBy string) error {
+	pkgID, err := s.UpsertPackage(ctx, tenantID, name)
+	if err != nil {
+		return err
+	}
+
+	pv := &PackageVersion{
+		PackageID:   pkgID,
+		Version:     version,
+		Digest:      digest,
+		SizeBytes:   sizeBytes,
+		StorageKey:  storageKey,
+		Manifest:    manifest,
+		PublishedBy: publishedBy,
+	}
+
+	return s.InsertVersion(ctx, pkgID, pv)
+}
+
+// FetchPackage retrieves a specific version's registry details.
+func (s *Store) FetchPackage(ctx context.Context, tenantID string, name string, version string) (*RegistryPackageInfo, error) {
+	pv, err := s.GetVersionByNameVersion(ctx, tenantID, name, version)
+	if err != nil {
+		return nil, err
+	}
+	if pv == nil {
+		return nil, nil
+	}
+
+	return &RegistryPackageInfo{
+		Name:        name,
+		Version:     pv.Version,
+		Digest:      pv.Digest,
+		SizeBytes:   pv.SizeBytes,
+		PublishedBy: pv.PublishedBy,
+	}, nil
+}
+
+// ListPackages retrieves all published package versions inside a tenant scope.
+func (s *Store) ListPackages(ctx context.Context, tenantID string) ([]RegistryPackageInfo, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	const q = `
+		SELECT p.name, pv.version, pv.digest, pv.size_bytes, pv.published_by
+		FROM package_versions pv
+		JOIN packages p ON p.id = pv.package_id
+		WHERE p.tenant_id = $1
+		ORDER BY p.name ASC, pv.created_at DESC
+	`
+	rows, err := s.db.Query(ctx, q, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RegistryPackageInfo
+	for rows.Next() {
+		var info RegistryPackageInfo
+		if err := rows.Scan(&info.Name, &info.Version, &info.Digest, &info.SizeBytes, &info.PublishedBy); err != nil {
+			return nil, err
+		}
+		results = append(results, info)
+	}
+	return results, nil
+}
+
+

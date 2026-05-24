@@ -1,23 +1,19 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cloud-shuttle/drover-registry/internal/api/handlers"
 	"github.com/cloud-shuttle/drover-registry/internal/api/middleware"
 	"github.com/cloud-shuttle/drover-registry/internal/config"
 	"github.com/cloud-shuttle/drover-registry/internal/infra"
 	"github.com/cloud-shuttle/drover-registry/internal/metadata"
-	appstorage "github.com/cloud-shuttle/drover-registry/internal/storage"
 	"github.com/cloud-shuttle/drover-registry/internal/webhook"
 	"github.com/gofiber/fiber/v2"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
@@ -113,116 +109,23 @@ func main() {
 	// Enforce that every request on /v1 has a tenant
 	api.Use(middleware.RequireTenant())
 
-	// Real package routes (with tenant from context)
-	registerPackageRoutes(api, storageProvider, db, cfg, appLogger)
+	// Package routes (logic extracted to internal/api/handlers/packages.go)
+	var meta *metadata.Store
+	if db != nil {
+		meta = metadata.NewStore(db)
+	}
+	var hook *webhook.Publisher
+	if cfg.MusterWebhookURL != "" {
+		hook = webhook.NewPublisher(cfg)
+	}
 
-	// === Basic OCI distribution support (single-layer oras push) ===
-	// Supports monolithic blob upload + manifest for simple artifacts.
-	// Not a full registry (no chunking, limited auth integration).
+	pkgHandler := handlers.NewPackageHandler(storageProvider, meta, hook, appLogger, cfg)
+	pkgHandler.RegisterRoutes(api)
+
+	// OCI routes (extracted to internal/api/handlers/oci.go)
 	oci := app.Group("/v2")
-	oci.Get("/", func(c *fiber.Ctx) error {
-		c.Set("Docker-Distribution-API-Version", "registry/2.0")
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	// In-memory upload sessions for demo (in real life use Redis/DB)
-	uploadSessions := make(map[string]string) // uuid -> repository name
-
-	// Start blob upload
-	oci.Post("/:name/blobs/uploads/", func(c *fiber.Ctx) error {
-		name := c.Params("name")
-		uuid := "u" + fmt.Sprintf("%d", time.Now().UnixNano())
-		uploadSessions[uuid] = name
-
-		location := fmt.Sprintf("/v2/%s/blobs/uploads/%s", name, uuid)
-		c.Set("Location", location)
-		c.Set("Docker-Upload-Uuid", uuid)
-		c.Set("Docker-Distribution-API-Version", "registry/2.0")
-		return c.SendStatus(fiber.StatusAccepted)
-	})
-
-	// Complete blob upload (monolithic)
-	oci.Put("/:name/blobs/uploads/:uuid", func(c *fiber.Ctx) error {
-		name := c.Params("name")
-		uuid := c.Params("uuid")
-		digest := c.Query("digest")
-
-		if digest == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "digest query parameter required"})
-		}
-
-		// Read entire body (for small layers this is fine)
-		body := c.Body()
-		if len(body) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty blob"})
-		}
-
-		// Store using our existing provider under a synthetic tenant for OCI demo
-		tenant := "oci"
-		ref := appstorage.PackageRef{
-			TenantID: tenant,
-			Name:     name,
-			Version:  digest, // use digest as "version" for uniqueness
-			Digest:   digest,
-		}
-
-		_, err := storageProvider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), digest)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		delete(uploadSessions, uuid)
-
-		c.Set("Docker-Distribution-API-Version", "registry/2.0")
-		c.Set("Location", fmt.Sprintf("/v2/%s/blobs/%s", name, digest))
-		return c.SendStatus(fiber.StatusCreated)
-	})
-
-	// Head blob (existence check)
-	oci.Head("/:name/blobs/:digest", func(c *fiber.Ctx) error {
-		digest := c.Params("digest")
-		// Quick existence via storage (we use a synthetic ref)
-		ref := appstorage.PackageRef{TenantID: "oci", Name: c.Params("name"), Version: digest, Digest: digest}
-		exists, _ := storageProvider.Exists(c.Context(), ref)
-		if !exists {
-			return c.SendStatus(fiber.StatusNotFound)
-		}
-		c.Set("Docker-Distribution-API-Version", "registry/2.0")
-		c.Set("Docker-Content-Digest", digest)
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	// Manifest put (the final step of oras push)
-	oci.Put("/:name/manifests/:ref", func(c *fiber.Ctx) error {
-		name := c.Params("name")
-		tag := c.Params("ref") // can be tag or digest
-		body := c.Body()
-
-		// For demo we store the manifest the same way
-		digest := fmt.Sprintf("sha256:manifest-%d", time.Now().UnixNano()) // real impl would parse and compute digest
-		ref := appstorage.PackageRef{
-			TenantID: "oci",
-			Name:     name,
-			Version:  tag,
-			Digest:   digest,
-		}
-		_, err := storageProvider.Put(c.Context(), ref, bytes.NewReader(body), int64(len(body)), digest)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		c.Set("Docker-Distribution-API-Version", "registry/2.0")
-		c.Set("Docker-Content-Digest", digest)
-		c.Set("Location", fmt.Sprintf("/v2/%s/manifests/%s", name, tag))
-		return c.SendStatus(fiber.StatusCreated)
-	})
-
-	// Basic manifest get (for pull)
-	oci.Get("/:name/manifests/:ref", func(c *fiber.Ctx) error {
-		// For a real single-layer flow this would return the manifest we stored.
-		// Stub for now so oras push at least succeeds; full roundtrip later.
-		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "OCI manifest GET not fully wired for pull yet"})
-	})
+	ociHandler := handlers.NewOCIHandler(storageProvider, appLogger)
+	ociHandler.RegisterRoutes(oci)
 
 	// Start server
 	addr := fmt.Sprintf("%s:%d", cfg.ServerHost, cfg.ServerPort)
@@ -246,179 +149,9 @@ func main() {
 	appLogger.Info("server stopped")
 }
 
-func registerPackageRoutes(api fiber.Router, provider appstorage.Provider, db *infra.DB, cfg config.Config, appLogger *slog.Logger) {
-	// Create metadata store when DB is available
-	var metaStore *metadata.Store
-	if db != nil {
-		metaStore = metadata.NewStore(db)
-	}
-
-	// Webhook publisher to drover-muster (fire-and-forget)
-	var hookPublisher *webhook.Publisher
-	if cfg.MusterWebhookURL != "" {
-		hookPublisher = webhook.NewPublisher(cfg)
-	}
-
-	// POST /v1/packages - real implementation with manifest extraction + Postgres
-	api.Post("/packages", func(c *fiber.Ctx) error {
-		tenant := middleware.GetTenant(c)
-
-		// 1. Obtain the artifact bytes (support raw body or multipart "file")
-		var artifactReader io.Reader
-		var artifactSize int64
-		contentType := c.Get("Content-Type")
-
-		if strings.HasPrefix(contentType, "multipart/form-data") {
-			form, err := c.MultipartForm()
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid multipart form"})
-			}
-			files := form.File["file"]
-			if len(files) == 0 {
-				files = form.File["artifact"]
-			}
-			if len(files) == 0 {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "no 'file' field in multipart upload"})
-			}
-			fh := files[0]
-			artifactSize = fh.Size
-			f, err := fh.Open()
-			if err != nil {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to open uploaded file"})
-			}
-			defer f.Close()
-			artifactReader = f
-		} else {
-			// raw body
-			body := c.Body()
-			if len(body) == 0 {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "empty body (send tarball as raw body or multipart 'file')"})
-			}
-			artifactReader = bytes.NewReader(body)
-			artifactSize = int64(len(body))
-		}
-
-		// 2. Try to extract manifest.json from the tarball (best effort)
-		manifest, manifestRaw, err := metadata.ExtractManifestFromTarball(artifactReader)
-		if err != nil {
-			appLogger.Warn("manifest extraction failed (continuing without it)", "error", err)
-		}
-
-		// Reset reader because we consumed it during extraction.
-		// For this milestone we support in-memory or seekable readers (multipart files are re-opened by the form lib).
-		var finalReader io.Reader
-		if rs, ok := artifactReader.(io.ReadSeeker); ok {
-			rs.Seek(0, 0)
-			finalReader = rs
-		} else if b, ok := artifactReader.(*bytes.Reader); ok {
-			b.Seek(0, 0)
-			finalReader = b
-		} else {
-			// multipart file case: the original file handle from the form is still valid
-			finalReader = artifactReader
-		}
-
-		// 3. Determine final name/version (prefer manifest)
-		name := c.Query("name", "unnamed")
-		version := c.Query("version", "v0.0.0-dev")
-		if manifest != nil {
-			if manifest.Name != "" {
-				name = manifest.Name
-			}
-			if manifest.Version != "" {
-				version = manifest.Version
-			}
-		}
-
-		digest := c.Query("digest", fmt.Sprintf("sha256:upload-%d", time.Now().UnixNano()))
-		ref := appstorage.PackageRef{
-			TenantID: tenant,
-			Name:     name,
-			Version:  version,
-			Digest:   digest,
-		}
-
-		// 4. Store the artifact
-		info, err := provider.Put(c.Context(), ref, finalReader, artifactSize, digest)
-		if err != nil {
-			appLogger.Error("storage put failed", "error", err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
-
-		// 5. Persist metadata if DB is available
-		var dbID int64
-		if metaStore != nil {
-			pkgID, err := metaStore.UpsertPackage(c.Context(), tenant, name)
-			if err == nil {
-				publishedBy := "dev"
-				if v := c.Locals("userID"); v != nil {
-					if s, ok := v.(string); ok && s != "" {
-						publishedBy = s
-					}
-				}
-				mv := &metadata.PackageVersion{
-					PackageID:   pkgID,
-					Version:     version,
-					Digest:      digest,
-					SizeBytes:   info.Size,
-					StorageKey:  info.StorageKey,
-					Manifest:    manifestRaw,
-					PublishedBy: publishedBy,
-				}
-				_ = metaStore.InsertVersion(c.Context(), pkgID, mv)
-				dbID = mv.ID
-			}
-		}
-
-		// 6. Fire webhook to drover-muster (non-blocking)
-		if hookPublisher != nil {
-			go func() {
-				_ = hookPublisher.Publish(context.Background(), tenant, name, version, digest, info.Size, info.StorageKey)
-			}()
-		}
-
-		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"message":     "package published",
-			"tenant":      tenant,
-			"name":        name,
-			"version":     version,
-			"size":        info.Size,
-			"digest":      digest,
-			"storage_key": info.StorageKey,
-			"db_record":   dbID > 0,
-		})
-	})
-
-	api.Get("/packages/:tenant/:name/:version", func(c *fiber.Ctx) error {
-		ref := appstorage.PackageRef{
-			TenantID: c.Params("tenant"),
-			Name:     c.Params("name"),
-			Version:  c.Params("version"),
-			Digest:   c.Query("digest", ""),
-		}
-
-		rc, info, err := provider.Get(c.Context(), ref)
-		if err != nil {
-			if errors.Is(err, appstorage.ErrNotFound) {
-				return c.SendStatus(fiber.StatusNotFound)
-			}
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
-		}
-		defer rc.Close()
-
-		c.Set("Content-Type", "application/octet-stream")
-		c.Set("Content-Length", fmt.Sprintf("%d", info.Size))
-		return c.SendStream(rc)
-	})
-
-	api.Get("/packages/:tenant", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"tenant":   c.Params("tenant"),
-			"message":  "list endpoint - full metadata index coming with more queries",
-			"packages": []string{},
-		})
-	})
-}
+// registerPackageRoutes has been replaced by handlers.PackageHandler.RegisterRoutes
+// (see internal/api/handlers/packages.go). The old implementation has been removed
+// as part of the extraction for better testability.
 
 func parseLogLevel(l string) slog.Level {
 	switch l {
