@@ -31,18 +31,19 @@ func NewPublisher(cfg config.Config) *Publisher {
 
 // Payload is the event sent to muster on publish.
 type Payload struct {
-	Event     string `json:"event"`
-	TenantID  string `json:"tenant_id"`
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	Digest    string `json:"digest"`
-	Size      int64  `json:"size"`
-	StorageKey string `json:"storage_key,omitempty"`
-	Timestamp string `json:"timestamp"`
+	Event      string          `json:"event"`
+	TenantID   string          `json:"tenant_id"`
+	Name       string          `json:"name"`
+	Version    string          `json:"version"`
+	Digest     string          `json:"digest"`
+	Size       int64           `json:"size"`
+	StorageKey string          `json:"storage_key,omitempty"`
+	Timestamp  string          `json:"timestamp"`
+	Manifest   json.RawMessage `json:"manifest,omitempty"`
 }
 
 // Publish sends the event (fire-and-forget with best effort).
-func (p *Publisher) Publish(ctx context.Context, tenant, name, version, digest string, size int64, storageKey string) error {
+func (p *Publisher) Publish(ctx context.Context, tenant, name, version, digest string, size int64, storageKey string, manifestRaw []byte) error {
 	if p.url == "" {
 		return nil // no-op when not configured
 	}
@@ -56,6 +57,7 @@ func (p *Publisher) Publish(ctx context.Context, tenant, name, version, digest s
 		Size:       size,
 		StorageKey: storageKey,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+		Manifest:   manifestRaw,
 	}
 
 	body, _ := json.Marshal(payload)

@@ -156,7 +156,7 @@ func (h *PackageHandler) Publish(c *fiber.Ctx) error {
 	// 6. Webhook (non-blocking)
 	if h.HookPublisher != nil {
 		go func() {
-			_ = h.HookPublisher.Publish(context.Background(), tenant, name, version, digest, info.Size, info.StorageKey)
+			_ = h.HookPublisher.Publish(context.Background(), tenant, name, version, digest, info.Size, info.StorageKey, manifestRaw)
 		}()
 	}
 
