@@ -181,6 +181,19 @@ func (h *PackageHandler) GetPackage(c *fiber.Ctx) error {
 		Digest:   c.Query("digest", ""),
 	}
 
+	// Try to get digest from DB to set ETag / Digest headers for client verification
+	if h.MetaStore != nil {
+		if pv, err := h.MetaStore.GetVersionByNameVersion(c.Context(), ref.TenantID, ref.Name, ref.Version); err == nil && pv != nil {
+			if ref.Digest == "" {
+				ref.Digest = pv.Digest
+			}
+			if pv.Digest != "" {
+				c.Set("ETag", fmt.Sprintf(`"%s"`, pv.Digest))
+				c.Set("Digest", pv.Digest)
+			}
+		}
+	}
+
 	rc, info, err := h.Provider.Get(c.Context(), ref)
 	if err != nil {
 		if err == storage.ErrNotFound {
@@ -192,6 +205,13 @@ func (h *PackageHandler) GetPackage(c *fiber.Ctx) error {
 
 	c.Set("Content-Type", "application/octet-stream")
 	c.Set("Content-Length", fmt.Sprintf("%d", info.Size))
+	
+	// Fallback headers if DB was unavailable but storage provider returned checksum
+	if c.GetRespHeader("ETag") == "" && info.Checksum != "" {
+		c.Set("ETag", fmt.Sprintf(`"%s"`, info.Checksum))
+		c.Set("Digest", info.Checksum)
+	}
+
 	return c.SendStream(rc)
 }
 

@@ -2,6 +2,8 @@ package s3
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -90,16 +92,24 @@ func (s *S3) key(ref appstorage.PackageRef) string {
 func (s *S3) Put(ctx context.Context, ref appstorage.PackageRef, r io.Reader, size int64, checksum string) (*appstorage.ObjectInfo, error) {
 	key := s.key(ref)
 
-	// For strong integrity we can use S3 checksum headers in newer SDKs.
-	// For broad compatibility we verify after upload (or use SDK checksum mode).
+	h := sha256.New()
+	tr := io.TeeReader(r, h)
+
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
-		Body:   r,
+		Body:   tr,
 		// ContentLength: aws.Int64(size), // optional
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 put: %w", err)
+	}
+
+	got := "sha256:" + hex.EncodeToString(h.Sum(nil))
+	if got != checksum {
+		// Clean up the invalid upload
+		_ = s.Delete(ctx, ref)
+		return nil, fmt.Errorf("%w: got %s want %s", appstorage.ErrChecksumMismatch, got, checksum)
 	}
 
 	// Best-effort: verify by head

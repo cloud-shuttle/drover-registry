@@ -10,13 +10,13 @@ import (
 )
 
 func TestNewOCIHandler(t *testing.T) {
-	h := NewOCIHandler(&fakeStorage{}, slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	h := NewOCIHandler(&fakeStorage{}, nil, slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	require.NotNil(t, h)
 	require.NotNil(t, h.uploadSessions)
 }
 
 func TestOCIHandler_Ping(t *testing.T) {
-	h := NewOCIHandler(&fakeStorage{}, slog.Default())
+	h := NewOCIHandler(&fakeStorage{}, nil, slog.Default())
 
 	app := fiber.New()
 	v2g := app.Group("/v2")

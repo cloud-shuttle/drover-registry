@@ -124,7 +124,7 @@ func main() {
 
 	// OCI routes (extracted to internal/api/handlers/oci.go)
 	oci := app.Group("/v2")
-	ociHandler := handlers.NewOCIHandler(storageProvider, appLogger)
+	ociHandler := handlers.NewOCIHandler(storageProvider, meta, appLogger)
 	ociHandler.RegisterRoutes(oci)
 
 	// Start server
