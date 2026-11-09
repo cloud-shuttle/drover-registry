@@ -50,10 +50,12 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) (to be written) and the backl
 
 ## Current Status
 
-Early scaffold. See `.beads/issues.jsonl` for the detailed task breakdown (dreg-000 epic etc.).
+> **Docs correction (rationalization 2026-11-09):** the “health-only scaffold” description is **stale**. This tree includes a real `cmd/server`, metadata/storage/package/OCI handlers, and a Muster publication webhook. Treat it as an early but real package service, not an empty stub.
 
-Implemented so far:
-- Basic Fiber HTTP server with `/healthz` + `/readyz`
+See `.beads/issues.jsonl` for the detailed task breakdown (dreg-000 epic etc.).
+
+**Implemented (inspected):**
+- Fiber HTTP server with `/healthz` + `/readyz`
 - Project layout matching Drover ecosystem conventions
 - MIT license + contributing guide
 
@@ -120,3 +122,7 @@ MIT — see [LICENSE](./LICENSE)
 ---
 
 Built with ❤️ by [Cloud Shuttle](https://cloudshuttle.com.au) for the autonomous engineering future.
+
+## Consolidation note (rationalization 2026-11-09)
+
+**Conditional** fold into [`drover-muster`](https://github.com/cloud-shuttle/drover-muster) `internal/packages` is under consideration — not a blind deletion. Muster owns capability discovery; retain immutable blob storage, digest semantics and tenant boundaries. First map live HTTP consumers and deployed package routes. **Not executed** in this PR; needs Peter's approval after consumer inventory.
