@@ -1,8 +1,16 @@
 # drover-registry
 
+![Status: stale](https://img.shields.io/badge/status-stale-d29922)
+
+> **Status, checked 18 Nov 2026: STALE.** Versioned agent and crew package store with OCI handlers and a webhook to Muster. Last code change 25 May 2026. Becomes the bundle store in M4.
+>
+> **Clean-clone check:** `go build ./...` and `go test -short ./...` pass.
+>
+> **Roadmap:** [ROADMAP.md](ROADMAP.md). Program tracking: Drover gap program (M0 to M4).
+
 **Distributed Agent Registry & Crew Store** — versioned storage and distribution for agent logic, crew templates, and MCP-compatible artifacts in the Drover ecosystem.
 
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](https://go.dev/)
 [![Fiber](https://img.shields.io/badge/Fiber-v2-4A90E2)](https://gofiber.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -46,7 +54,7 @@ Packages are stored as immutable, checksummed tarballs (or OCI artifacts) in S3/
                      └──────────────────┘
 ```
 
-See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) (to be written) and the backlog in `.beads/issues.jsonl`.
+An architecture doc has not been written yet; see the code layout above and the backlog in `.beads/issues.jsonl`.
 
 ## Current Status
 
@@ -54,13 +62,13 @@ See [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) (to be written) and the backl
 
 See `.beads/issues.jsonl` for the detailed task breakdown (dreg-000 epic etc.).
 
-**Implemented (inspected):**
-- Fiber HTTP server with `/healthz` + `/readyz`
-- Project layout matching Drover ecosystem conventions
-- MIT license + contributing guide
+**Implemented (inspected 18 Nov 2026):**
+- Fiber HTTP server (`cmd/server`) with `/healthz` and `/readyz`
+- Package metadata, storage and OCI handlers (`internal/api`, `internal/metadata`, `internal/storage`)
+- Webhook that forwards package manifest JSON to Muster (`internal/webhook`)
+- MIT licence and contributing guide
 
-Next up (dreg-001):
-- Storage abstraction + local disk backend + hash verification
+Not done yet: signatures and supply-chain metadata (epic #15), deployment (epic #16), and the extension bundle media type planned for M4 (see [ROADMAP.md](ROADMAP.md)).
 
 ## Quick Start (Dev)
 
@@ -80,15 +88,16 @@ curl http://localhost:8080/healthz
 
 ## Development
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) and upcoming `docs/DEVELOPMENT.md`.
+See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-### Local Stack (planned)
+### Local stack
 
 ```bash
-docker compose up -d   # postgres + minio + ...
-make migrate
+make dev-stack   # docker compose up, then migrate-up
 make run
 ```
+
+The Makefile has `migrate-up` and `migrate-down`; there is no `make migrate`.
 
 ## Integration Points
 
@@ -124,5 +133,7 @@ MIT — see [LICENSE](./LICENSE)
 Built with ❤️ by [Cloud Shuttle](https://cloudshuttle.com.au) for the autonomous engineering future.
 
 ## Consolidation note (rationalization 2026-11-09)
+
+> **Update 18 Nov 2026:** the gap program plan keeps Registry as the OCI store for extension bundles in M4, with Muster owning validation and activation. That makes a fold into Muster less likely; the decision still needs Peter after the consumer inventory below.
 
 **Conditional** fold into [`drover-muster`](https://github.com/cloud-shuttle/drover-muster) `internal/packages` is under consideration — not a blind deletion. Muster owns capability discovery; retain immutable blob storage, digest semantics and tenant boundaries. First map live HTTP consumers and deployed package routes. **Not executed** in this PR; needs Peter's approval after consumer inventory.
