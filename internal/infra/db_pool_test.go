@@ -10,6 +10,7 @@ func TestPoolConfigRouting(t *testing.T) {
 		max  int32
 	}{
 		{"postgres://u:p@abc.aws-ap-southeast-2.horizon.psdb.cloud:5432/registry?sslmode=require", 6432, 3},
+		{"postgres://u:p@aws-ap-southeast-2-1.pg.psdb.cloud:5432/registry?sslmode=require", 6432, 3},
 		{"postgres://u:p@localhost:5432/registry?sslmode=disable", 5432, 3},
 		{"postgres://u:p@localhost:5432/registry?sslmode=disable&pool_max_conns=10", 5432, 10},
 	}
