@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cloud-shuttle/drover-libs/pkg/pgpool"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,14 +15,10 @@ type DB struct {
 }
 
 func NewDB(ctx context.Context, databaseURL string) (*DB, error) {
-	config, err := pgxpool.ParseConfig(databaseURL)
+	config, err := PoolConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse database URL: %w", err)
 	}
-
-	// Good production defaults
-	config.MaxConns = 20
-	config.MinConns = 2
 
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
@@ -29,10 +26,21 @@ func NewDB(ctx context.Context, databaseURL string) (*DB, error) {
 	}
 
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
 	return &DB{pool: pool}, nil
+}
+
+// PoolConfig is the registry's only pool. Every query is a short statement or
+// an explicit transaction with no session state (no LISTEN, session advisory
+// locks, temp tables or session SET), so it is Pooled: on a PlanetScale host
+// it goes through PgBouncer on 6432 with 3 connections. Other hosts keep their
+// port. pool_max_conns in the URL overrides the size; DROVER_PG_POOLER=off
+// disables the rewrite.
+func PoolConfig(databaseURL string) (*pgxpool.Config, error) {
+	return pgpool.Config(databaseURL, pgpool.Pooled)
 }
 
 func (db *DB) Close() {
